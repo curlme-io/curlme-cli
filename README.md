@@ -55,6 +55,14 @@ Manage your request bins.
 Inspect requests in your active bin.
 
 * **`curlme listen [binId]`** (alias: `tail`): Stream incoming requests in real-time.
+
+  * **Interactive Shortcuts**:
+
+    * `[Enter]`: Inspect latest request
+    * `[R]`: Replay latest request
+    * `[D]`: Diff latest vs previous
+    * `[O]`: Open bin in dashboard
+
 * **`curlme latest [binId]`** (alias: `l`): Show the headers and body of the most recent request.
 * **`curlme show <requestId> [binId]`** (alias: `s`): Show details for a specific request ID or short ID.
 
