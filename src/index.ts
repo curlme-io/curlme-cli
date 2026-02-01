@@ -13,9 +13,21 @@ import os from 'os';
 
 process.on('unhandledRejection', (reason) => {
   // Enquirer throws an empty string/nothing when interrupted with Ctrl+C
-  if (reason === '' || (reason as any)?.name === 'Error') {
+  if (reason === '') {
     process.exit(0);
   }
+  if (reason instanceof Error) {
+    console.error(pc.red(`\n✖ Error: ${reason.message}`));
+    if (process.env.DEBUG) console.error(reason.stack);
+  } else if (reason) {
+    console.error(pc.red(`\n✖ Unhandled error: ${reason}`));
+  }
+  process.exit(1);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error(pc.red(`\n✖ Fatal Error: ${error.message}`));
+  if (process.env.DEBUG) console.error(error.stack);
   process.exit(1);
 });
 
@@ -30,6 +42,27 @@ const requireBin = (binId?: string) => {
 };
 
 const formatShortId = (id: string) => `rq_${id.substring(0, 6)}`;
+
+const handleBinError = (error: any, binId: string) => {
+  const isNotFound = error.response?.status === 404 || error.message?.includes('not found');
+  if (isNotFound && binId === getActiveBin()) {
+    config.delete('activeBinId');
+    return `Bin ${binId} not found. Active bin cleared.`;
+  }
+  return `Error: ${error.message}`;
+};
+
+async function openUrl(url: string) {
+  try {
+    // Dynamically import 'open' to avoid TS transpiling it to require() in CJS mode
+    const _importDynamic = new Function('specifier', 'return import(specifier)');
+    const { default: open } = await _importDynamic('open');
+    await open(url);
+  } catch (error: any) {
+    console.error(pc.red(`\n✖ Failed to open browser: ${error.message}`));
+    console.log(`  Please visit: ${pc.cyan(url)}\n`);
+  }
+}
 
 async function checkUsage() {
   try {
@@ -119,6 +152,11 @@ ${pc.bold('COMMANDS')}
   ${pc.yellow('billing')}         Manage your subscription
   ${pc.yellow('feedback')}        Send feedback or report a bug
 
+${pc.bold('AUTH')}
+  ${pc.yellow('auth login')}      Authenticate your CLI
+  ${pc.yellow('auth whoami')}     Show current user
+  ${pc.yellow('auth logout')}     Remove API key
+
 ${pc.bold('BINS')}
   ${pc.yellow('bin create')}      Create a new bin
   ${pc.yellow('bin list')}        List all your bins
@@ -195,11 +233,10 @@ program
   .command('upgrade')
   .description('Upgrade your account for more requests and features')
   .action(async () => {
-    const open = require('open');
     const url = `${api.getBaseUrl()}/pricing`;
     console.log(`\n${pc.yellow('➜')} Opening ${pc.bold(url)}`);
     console.log(`${pc.dim('You’ll be redirected to Stripe to complete your payment securely.')}\n`);
-    await open(url);
+    await openUrl(url);
     console.log(`${pc.dim('Save hundreds of hours manual debugging with Pro.')}\n`);
   });
 
@@ -207,18 +244,16 @@ program
   .command('billing')
   .description('Manage your subscription and billing details')
   .action(async () => {
-    const open = require('open');
     const url = `${api.getBaseUrl()}/account?tab=plan`;
     console.log(`\n${pc.yellow('➜')} Opening ${pc.bold(url)}`);
     console.log(`${pc.dim('You’ll be redirected to the billing portal to manage your plan.')}\n`);
-    await open(url);
+    await openUrl(url);
   });
 
 program
   .command('feedback')
   .description('Provide feedback or report an issue')
   .action(async () => {
-    const open = require('open');
     const version = '1.0.0'; // Should ideally pull from package.json
     const platform = os.platform();
     const release = os.release();
@@ -241,7 +276,7 @@ ${platform} ${release}
     console.log(`- What you were trying to do`);
     console.log(`- What happened instead\n`);
     
-    await open(url);
+    await openUrl(url);
   });
 
 // --- BIN GROUP ---
@@ -258,6 +293,11 @@ bin
       const data = await api.getBins();
       const activeBin = getActiveBin();
       if (spinner) spinner.stop();
+
+      // Validate active bin
+      if (activeBin && !data.some((b: any) => b.publicId === activeBin)) {
+        config.delete('activeBinId');
+      }
       
       if (options.json) {
         console.log(JSON.stringify(data, null, 2));
@@ -297,6 +337,10 @@ bin
         const bins = await api.getBins();
         if (bins.length === 0) {
           console.log(pc.yellow('\nNo bins found. Create one with `curlme bin create`'));
+          if (getActiveBin()) {
+            config.delete('activeBinId');
+            console.log(pc.dim('Active bin cleared.'));
+          }
           return;
         }
 
@@ -362,7 +406,11 @@ bin
       console.log(`  ${pc.bold('Link')}      ${pc.blue('curlme://bin/')}${pc.blue(b.publicId)} ${pc.dim('(app link)')}`);
       console.log('');
     } catch (error: any) {
-      spinner.fail(pc.red(`Bin not found: ${id}`));
+      spinner.fail(pc.red(`Bin not found: ${binId}`));
+      if (binId === getActiveBin()) {
+        config.delete('activeBinId');
+        console.log(pc.dim('Active bin cleared.'));
+      }
     }
   });
 
@@ -409,6 +457,21 @@ program
       console.log(`Run: ${pc.cyan('curlme bin use <binId>')}\n`);
       return;
     }
+
+    // Verify bin exists before listening
+    const spinner = ora(pc.dim('Verifying bin...')).start();
+    try {
+      await api.getBin(id);
+      spinner.stop();
+    } catch (error: any) {
+      spinner.fail(pc.red(`Bin ${id} not found.`));
+      if (!binId) {
+        config.delete('activeBinId');
+        console.log(pc.dim('Active bin cleared.'));
+      }
+      return;
+    }
+
     setActiveBin(id);
 
     console.log(`\n${pc.yellow('→')} Listening on ${pc.bold(id)} ${pc.dim('(active)')}`);
@@ -453,10 +516,9 @@ program
             }
             break;
           case 'o':
-            const open = require('open');
             const url = `${api.getBaseUrl()}/bin/${id}`;
             console.log(pc.dim(`\n  ── Opening ${url} ──`));
-            await open(url);
+            await openUrl(url);
             break;
         }
       });
@@ -508,7 +570,7 @@ program
       }
       formatRequest(reqs[0]);
     } catch (error: any) {
-      spinner.fail(pc.red(`Error: ${error.message}`));
+      spinner.fail(pc.red(handleBinError(error, id)));
     }
   });
 
@@ -530,7 +592,7 @@ program
       }
       formatRequest(r);
     } catch (error: any) {
-      spinner.fail(pc.red(`Error: ${error.message}`));
+      spinner.fail(pc.red(handleBinError(error, id)));
     }
   });
 
@@ -591,7 +653,7 @@ program
         replayedSpinner.fail(pc.red(`Failed: ${err.message}`));
       }
     } catch (error: any) {
-      if (spinner) spinner.fail(pc.red(`Error: ${error.message}`));
+      if (spinner) spinner.fail(pc.red(handleBinError(error, id)));
     }
   });
 
@@ -648,7 +710,7 @@ program
       console.log('');
     } catch (error: any) {
       spinner.stop();
-      console.error(pc.red(`✖ Error: ${error.message}`));
+      console.error(pc.red(handleBinError(error, id)));
     }
   });
 
@@ -657,10 +719,9 @@ program
   .description('Open the dashboard for a bin')
   .action(async (binId) => {
     const id = requireBin(binId);
-    const open = require('open');
     const url = `${api.getBaseUrl()}/bin/${id}`;
     console.log(`${pc.green('✔')} Opening ${pc.cyan(url)}`);
-    await open(url);
+    await openUrl(url);
   });
 
 // --- EXPORT COMMAND ---
@@ -676,7 +737,7 @@ program
       spinner.succeed(pc.green('Export complete'));
       console.log(JSON.stringify(data, null, 2));
     } catch (error: any) {
-      spinner.fail(pc.red(`Export failed: ${error.message}`));
+      spinner.fail(pc.red(handleBinError(error, id)));
     }
   });
 
