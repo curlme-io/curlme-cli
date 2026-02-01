@@ -78,6 +78,7 @@ program.helpInformation = function() {
 
   return `
 ${pc.bold('curlme')} ${pc.dim('— terminal-first request debugging')}
+${pc.dim('Docs: https://docs.curlme.io')}
 
 ${pc.bold('COMMANDS')}
   ${pc.yellow('listen')}          Stream requests + interactive shortcuts
