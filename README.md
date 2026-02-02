@@ -1,6 +1,10 @@
-# curlme.io CLI
+# curlme CLI
 
-The terminal-first request inspection tool. Capture, inspect, and replay HTTP requests directly from your command line.
+## Terminal-first HTTP request debugging
+
+Capture, inspect, replay, and diff HTTP requests directly from your terminal.
+
+Part of [curlme.io](https://curlme.io) - a terminal-first HTTP request debugging tool that keeps the entire debugging loop in the terminal. No dashboards required. No infrastructure setup.
 
 ## Installation
 

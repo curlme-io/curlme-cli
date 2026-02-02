@@ -1,7 +1,7 @@
 {
   "name": "@curlme/cli",
   "version": "1.0.2",
-  "description": "Terminal-first CLI for curlme.io",
+  "description": "Terminal-first HTTP request debugging. Capture, inspect, replay, and diff HTTP requests directly from your terminal.",
   "main": "dist/index.js",
   "bin": {
     "curlme": "dist/index.js"
