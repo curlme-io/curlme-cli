@@ -1,85 +1,106 @@
 # curlme CLI
 
-## Terminal-first HTTP request debugging
+Terminal-first HTTP request debugging.
 
-Capture, inspect, replay, and diff HTTP requests directly from your terminal.
-
-Part of [curlme.io](https://curlme.io) - a terminal-first HTTP request debugging tool that keeps the entire debugging loop in the terminal. No dashboards required. No infrastructure setup.
+Capture, inspect, replay, and diff HTTP requests directly from your terminal with minimal typing.
 
 ## Installation
-
-Install the CLI globally via npm:
 
 ```bash
 npm install -g @curlme/cli
 ```
 
-## Getting Started
+## 60-second quickstart
 
-1. **Login**: Generate an API key at [curlme.io/account](https://curlme.io/account) and authenticate:
+```bash
+curlme
+curlme listen
+```
 
-    ```bash
-    curlme auth login
-    ```
+If this is your first run, `curlme` creates a temporary bin, sets it active, and prints your endpoint.
 
-2. **Create a Bin**: Create your first bin to start receiving requests:
+If you prefer no auto-create:
 
-    ```bash
-    curlme bin create my-debug-bin
-    ```
+```bash
+curlme --no-create
+curlme init
+```
 
-3. **Listen**: Start a real-time stream of incoming requests:
+## Core workflow
 
-    ```bash
-    curlme listen
-    ```
+```bash
+curlme init stripe-dev
+curlme listen
+curlme latest
+curlme show 2
+curlme replay 1 --to http://localhost:3000/webhook
+curlme diff
+```
 
-## Command Reference
+## Context model
 
-### Authentication (`auth`)
+- Active bin is remembered per workspace (git root when available).
+- Use global context with `--global`.
+- After `init`/`new`, created bin becomes active automatically.
+- Ref selectors are most-recent-first:
+  - `1` = latest
+  - `2` = previous
+  - short request IDs are resolved inside the active bin
 
-Commands to manage your session and account.
+## Command reference
 
-* **`curlme auth login`**: Log in using your API key.
-* **`curlme auth whoami`**: Show the currently authenticated user.
-* **`curlme auth logout`**: Remove the stored API key.
+### Setup and context
 
-### Bin Management (`bin`)
+- `curlme init [name]` create temp/named bin and set active
+- `curlme new [name]` alias for `init`
+- `curlme bin` show current bin and recent bins (TTY: picker)
+- `curlme bin <name|id>` set active bin
+- `curlme bin set <name|id>` explicit set form
+- `curlme use [name|id]` alias for `bin`
+- `curlme status` show auth + active context + endpoint
 
-Manage your request bins.
+### Request debugging
 
-* **`curlme bin create [name]`**: Create a new bin. Sets it as the active bin automatically.
-* **`curlme bin list`** (alias: `ls`): List all bins in your account.
-* **`curlme bin use <id>`**: Set a specific bin as "active" for subsequent commands.
-* **`curlme bin info <id>`**: Show detailed information, including endpoint URLs.
-* **`curlme bin delete <id>`**: Permanently delete a bin and all its requests.
+- `curlme listen` / `curlme l` stream incoming requests
+- `curlme latest` show full latest request
+- `curlme latest --summary` compact single row
+- `curlme show [ref]` / `curlme s [ref]` show request details
+  - In TTY, missing ref opens a picker
+- `curlme replay [ref] --to <url>` / `curlme r [ref] --to <url>` replay request
+  - In TTY, missing ref opens a picker
+- `curlme diff [a] [b]` / `curlme d [a] [b]` compare requests
+  - Defaults to `1` vs `2`
 
-### Request Inspection
+### Utilities
 
-Inspect requests in your active bin.
+- `curlme open [ref]` open dashboard for active bin/request
+- `curlme export --format <json|curl>` export request history
+- `curlme login` authenticate with API key
+- `curlme upgrade` open billing/plan page
 
-* **`curlme listen [binId]`** (alias: `tail`): Stream incoming requests in real-time.
+## Scriptable output
 
-  * **Interactive Shortcuts**:
+Use `--json` for machine-readable output where supported.
 
-    * `[Enter]`: Inspect latest request
-    * `[R]`: Replay latest request
-    * `[D]`: Diff latest vs previous
-    * `[O]`: Open bin in dashboard
+```bash
+curlme latest --summary --json
+curlme export --format json --json
+```
 
-* **`curlme latest [binId]`** (alias: `l`): Show the headers and body of the most recent request.
-* **`curlme show <requestId> [binId]`** (alias: `s`): Show details for a specific request ID or short ID.
+## Deprecations
 
-### Advanced Tools
+Legacy commands still work with warnings and map to new commands. They are planned for removal in `v2.0`.
 
-* **`curlme replay [requestId] [binId] [--to <url>]`** (alias: `r`): Reforward a captured request to a local target (default: `http://localhost:3000`).
-* **`curlme diff [id1] [id2] [binId]`** (alias: `d`): Compare two requests for differences in body or headers.
-* **`curlme export [binId] [--format <json|curl>]`**: Export request data for use in other tools.
-* **`curlme open [binId]`**: Open the bin's dashboard in your default web browser.
+Examples:
 
-## Environment Variables
+- `curlme auth login` -> `curlme login`
+- `curlme request latest` -> `curlme latest`
+- `curlme bin create` -> `curlme init`
+- `curlme billing` -> `curlme upgrade`
 
-* `CURLME_API_URL`: Override the default API endpoint (defaults to `https://curlme.io`).
+## Environment variables
+
+- `CURLME_API_URL` override API base URL (default: `https://curlme.io`)
 
 ## License
 

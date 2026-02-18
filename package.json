@@ -1,6 +1,6 @@
 {
   "name": "@curlme/cli",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Terminal-first HTTP request debugging. Capture, inspect, replay, and diff HTTP requests directly from your terminal.",
   "main": "dist/index.js",
   "bin": {
@@ -13,6 +13,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@inquirer/prompts": "^7.8.4",
     "axios": "^1.6.0",
     "chalk": "^4.1.2",
     "commander": "^11.1.0",

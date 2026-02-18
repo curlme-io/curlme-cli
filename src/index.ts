@@ -1,744 +1,869 @@
 #!/usr/bin/env node
 import 'dotenv/config';
 import { Command } from 'commander';
-import chalk from 'chalk';
 import ora from 'ora';
-import { table } from 'table';
-import enquirer from 'enquirer';
-import api from './api';
-import config, { getActiveBin, setActiveBin } from './config';
 import pc from 'picocolors';
-import readline from 'readline';
-import os from 'os';
+import axios from 'axios';
+import { password, select } from '@inquirer/prompts';
+import api from './api';
+import config, { clearActiveBin, getActiveBin, getRecentBins, pushRecentBin, setActiveBin } from './config';
 
-process.on('unhandledRejection', (reason) => {
-  // Enquirer throws an empty string/nothing when interrupted with Ctrl+C
-  if (reason === '') {
-    process.exit(0);
-  }
-  if (reason instanceof Error) {
-    console.error(pc.red(`\n✖ Error: ${reason.message}`));
-    if (process.env.DEBUG) console.error(reason.stack);
-  } else if (reason) {
-    console.error(pc.red(`\n✖ Unhandled error: ${reason}`));
-  }
-  process.exit(1);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error(pc.red(`\n✖ Fatal Error: ${error.message}`));
-  if (process.env.DEBUG) console.error(error.stack);
-  process.exit(1);
-});
-
-const requireBin = (binId?: string) => {
-  const active = binId || getActiveBin();
-  if (!active) {
-    console.error(pc.red('✖ No bin specified and no active bin set.'));
-    console.log(`\nRun:\n  ${pc.cyan('curlme bin use <binId>')}\n  ${pc.cyan('curlme listen <binId>')}\n`);
-    process.exit(1);
-  }
-  return active;
+type BinRecord = {
+  id: string;
+  publicId: string;
+  name: string;
+  requestCount?: number;
 };
 
-const formatShortId = (id: string) => `rq_${id.substring(0, 6)}`;
-
-const handleBinError = (error: any, binId: string) => {
-  const isNotFound = error.response?.status === 404 || error.message?.includes('not found');
-  if (isNotFound && binId === getActiveBin()) {
-    config.delete('activeBinId');
-    return `Bin ${binId} not found. Active bin cleared.`;
-  }
-  return `Error: ${error.message}`;
+type RequestRecord = {
+  id: string;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  query?: Record<string, string>;
+  body?: string;
+  contentType?: string;
+  ip?: string;
+  timestamp: number;
+  size: number;
 };
 
-async function openUrl(url: string) {
-  try {
-    // Dynamically import 'open' to avoid TS transpiling it to require() in CJS mode
-    const _importDynamic = new Function('specifier', 'return import(specifier)');
-    const { default: open } = await _importDynamic('open');
-    await open(url);
-  } catch (error: any) {
-    console.error(pc.red(`\n✖ Failed to open browser: ${error.message}`));
-    console.log(`  Please visit: ${pc.cyan(url)}\n`);
-  }
-}
-
-async function checkUsage() {
-  try {
-    const usage = await api.getUsage();
-    if (usage && usage.count >= usage.limit) {
-      console.log(`\n${pc.yellow('⚠️ ')} ${pc.bold('You hit your monthly limit.')} (${pc.yellow(usage.count)}/${pc.dim(usage.limit)})`);
-      console.log(`  Upgrade now: ${pc.cyan('curlme upgrade')}\n`);
-      return true;
-    }
-  } catch (e) {
-    // Ignore usage check errors
-  }
-  return false;
-}
-
-const formatRequest = (r: any) => {
-  const displayId = formatShortId(r.id);
-  console.log(`\n${pc.yellow('→')} ${pc.bold('Request')} ${pc.yellow(displayId)}`);
-  console.log(`  ${pc.bold('Method')}    ${pc.yellow(r.method)}`);
-  console.log(`  ${pc.bold('Path')}      ${pc.dim(r.path)}`);
-  console.log(`  ${pc.bold('Source')}    ${pc.dim(r.ip || 'unknown')}`);
-  console.log(`  ${pc.bold('Size')}      ${pc.dim(r.size + 'B')}`);
-  
-  console.log(`\n  ${pc.bold('Headers')}`);
-  Object.entries(r.headers).forEach(([key, val]) => {
-    console.log(`    ${pc.dim(key.padEnd(12))} ${val}`);
-  });
-
-  if (r.body) {
-    console.log(`\n  ${pc.bold('Body')}`);
-    try {
-      const parsed = JSON.parse(r.body as string);
-      console.log(JSON.stringify(parsed, null, 2).split('\n').map(l => `    ${pc.dim(l)}`).join('\n'));
-    } catch {
-      console.log(`    ${pc.dim(r.body)}`);
-    }
-  }
-  console.log('');
+type GlobalOptions = {
+  bin?: string;
+  global?: boolean;
+  json?: boolean;
+  noCreate?: boolean;
 };
 
 const program = new Command();
 
-const DIVIDER = pc.dim('────────────────────────────────────────');
+const VERSION = '1.1.0';
+const KNOWN_TOP_LEVEL = [
+  'init',
+  'new',
+  'bin',
+  'use',
+  'listen',
+  'latest',
+  'show',
+  'replay',
+  'diff',
+  'open',
+  'export',
+  'login',
+  'status',
+  'upgrade',
+  'auth',
+  'billing',
+  'request'
+];
 
-const showFeedbackSuggestion = (isError = false) => {
-  if (isError) {
-    console.log(`\n${pc.dim('If this feels wrong, let us know:')}`);
-    console.log(`  ${pc.cyan('curlme feedback')}\n`);
+process.on('unhandledRejection', (reason) => {
+  if (reason === '') {
+    process.exit(0);
+  }
+  if (reason instanceof Error) {
+    console.error(pc.red(`Error: ${reason.message}`));
+  } else if (reason) {
+    console.error(pc.red(`Error: ${String(reason)}`));
+  }
+  process.exit(1);
+});
+
+const endpointFor = (binId: string) => `${api.getBaseUrl()}/h/${binId}`;
+const dashboardFor = (binId: string, requestId?: string) => {
+  const base = `${api.getBaseUrl()}/bin/${binId}`;
+  return requestId ? `${base}?requestId=${encodeURIComponent(requestId)}` : base;
+};
+
+const shortRequestId = (id: string) => (id.startsWith('req_') ? id.slice(0, 10) : `req_${id.slice(0, 6)}`);
+
+const toIso = (ts: number) => new Date(ts).toISOString();
+
+const toClock = (ts: number) => {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+};
+
+const bytes = (size: number) => {
+  if (size < 1024) return `${size}B`;
+  const kb = size / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)}KB`;
+  return `${(kb / 1024).toFixed(1)}MB`;
+};
+
+const printHeader = (binId: string, requestCount?: number, mode?: string) => {
+  const right = requestCount !== undefined ? `${requestCount} requests` : mode ?? 'ready';
+  console.log(`BIN ${binId}  |  endpoint ${endpointFor(binId)}  |  ${right}`);
+};
+
+const printRequestRow = (idx: number, req: RequestRecord) => {
+  const row = [
+    String(idx).padEnd(2),
+    toClock(req.timestamp).padEnd(8),
+    req.method.padEnd(6),
+    (req.path || '/').slice(0, 28).padEnd(28),
+    bytes(req.size).padStart(7),
+    shortRequestId(req.id)
+  ].join('  ');
+  console.log(row);
+};
+
+const printRequestDetail = (req: RequestRecord, indexLabel?: string) => {
+  const label = indexLabel ? `${indexLabel}  (${shortRequestId(req.id)})` : shortRequestId(req.id);
+  console.log(`Request ${label}`);
+  console.log(`Time: ${toIso(req.timestamp)}`);
+  console.log(`Method: ${req.method}`);
+  console.log(`Path: ${req.path || '/'}`);
+  console.log(`IP: ${req.ip || '-'}`);
+  console.log(`Size: ${bytes(req.size)}`);
+  console.log('');
+  console.log('Headers');
+  const entries = Object.entries(req.headers || {});
+  if (entries.length === 0) {
+    console.log('- (none)');
   } else {
-    const hasSeen = config.get('hasSeenFeedbackPrompt');
-    if (!hasSeen) {
-      console.log(`\n${pc.bold('Thanks for using curlme.')}`);
-      console.log(`Have feedback? ${pc.cyan('curlme feedback')}\n`);
-      config.set('hasSeenFeedbackPrompt', true);
+    for (const [k, v] of entries) {
+      console.log(`- ${k}: ${v}`);
     }
+  }
+  console.log('');
+  console.log('Body');
+  if (!req.body) {
+    console.log('(empty)');
+    return;
+  }
+  try {
+    const parsed = JSON.parse(req.body);
+    console.log(JSON.stringify(parsed, null, 2));
+  } catch {
+    console.log(req.body);
+  }
+};
+
+const levenshtein = (a: string, b: string): number => {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    for (let j = 1; j <= n; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+};
+
+const closestCommands = (inputCmd: string) => {
+  const scored = KNOWN_TOP_LEVEL.map((name) => ({ name, dist: levenshtein(inputCmd, name) }))
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, 3)
+    .map((x) => x.name);
+  return scored;
+};
+
+const isTTY = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+async function openUrl(url: string) {
+  try {
+    const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
+    const { default: open } = await dynamicImport('open');
+    await open(url);
+  } catch (error: any) {
+    console.error(pc.red(`Failed to open browser: ${error.message}`));
+    console.log(url);
+  }
+}
+
+const getBinOrExit = async (options: GlobalOptions): Promise<string> => {
+  const candidate = options.bin || getActiveBin(Boolean(options.global));
+  if (!candidate) {
+    console.error('No active bin. Run: curlme init (or: curlme bin <name|id>).');
+    process.exit(1);
+  }
+
+  try {
+    const bin = await api.getBin(candidate);
+    setActiveBin(bin.publicId, Boolean(options.global));
+    pushRecentBin(bin.publicId, Boolean(options.global));
+    return bin.publicId;
+  } catch {
+    if (!options.bin) {
+      clearActiveBin(Boolean(options.global));
+    }
+    console.error(`Active bin '${candidate}' not found. Set one with: curlme bin`);
+    process.exit(1);
+  }
+};
+
+const resolveRef = (ref: string | undefined, reqs: RequestRecord[]): RequestRecord | null => {
+  if (!ref) return null;
+  if (/^\d+$/.test(ref)) {
+    const index = Number(ref);
+    return reqs[index - 1] ?? null;
+  }
+  const matches = reqs.filter((r) => r.id === ref || r.id.startsWith(ref) || shortRequestId(r.id) === ref);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    throw new Error(`Short ID '${ref}' matches multiple requests. Use a longer prefix.`);
+  }
+  return null;
+};
+
+const pickRequest = async (reqs: RequestRecord[], title: string): Promise<RequestRecord | null> => {
+  if (!isTTY()) return null;
+  if (reqs.length === 0) return null;
+  const top = reqs.slice(0, 10);
+  const value = await select<string>({
+    message: title,
+    choices: top.map((r, i) => ({
+      value: r.id,
+      name: `${i + 1}. ${toClock(r.timestamp)}  ${r.method.padEnd(6)} ${(r.path || '/').slice(0, 32)}  ${shortRequestId(r.id)}`
+    }))
+  });
+  return top.find((r) => r.id === value) ?? null;
+};
+
+const requireRefOrPick = async (
+  ref: string | undefined,
+  reqs: RequestRecord[],
+  title: string
+): Promise<RequestRecord> => {
+  if (ref) {
+    const resolved = resolveRef(ref, reqs);
+    if (!resolved) {
+      throw new Error(`Request '${ref}' not found.`);
+    }
+    return resolved;
+  }
+
+  if (isTTY()) {
+    const picked = await pickRequest(reqs, title);
+    if (!picked) {
+      throw new Error('No requests in the active bin yet. Next: curlme listen');
+    }
+    return picked;
+  }
+
+  throw new Error('Missing <ref>. In non-TTY mode provide a request ref, e.g. `curlme show 1`.');
+};
+
+const parseDurationMs = (value?: string): number | undefined => {
+  if (!value) return undefined;
+  const match = value.trim().match(/^(\d+)(ms|s|m|h)?$/i);
+  if (!match) return undefined;
+  const amount = Number(match[1]);
+  const unit = (match[2] || 'ms').toLowerCase();
+  if (unit === 'ms') return amount;
+  if (unit === 's') return amount * 1000;
+  if (unit === 'm') return amount * 60_000;
+  if (unit === 'h') return amount * 3_600_000;
+  return undefined;
+};
+
+const printQuickHelp = () => {
+  console.log(program.helpInformation());
+  console.log('No active bin found. Run: curlme init');
+};
+
+const doInit = async (name?: string, options?: GlobalOptions) => {
+  const spinner = ora('Creating bin...').start();
+  try {
+    const binName = name || ('bin-' + Math.random().toString(36).slice(2, 8));
+    const bin = await api.createBin(binName);
+    setActiveBin(bin.publicId, Boolean(options?.global));
+    pushRecentBin(bin.publicId, Boolean(options?.global));
+    spinner.stop();
+
+    const createdKind = typeof bin.isTemporary === 'boolean'
+      ? (bin.isTemporary ? 'temporary bin' : 'bin')
+      : (config.get('apiKey') ? 'bin' : 'temporary bin');
+
+    console.log(`Created ${createdKind}: ${bin.publicId}`);
+    console.log(`Endpoint: ${endpointFor(bin.publicId)}`);
+    console.log('Active bin set for this workspace.');
+    console.log('');
+    console.log('Next: curlme listen');
+  } catch (error: any) {
+    spinner.fail(`Failed to create bin: ${error.message}`);
+  }
+};
+
+const doBinSet = async (selector?: string, global = false) => {
+  if (!selector) {
+    const bins = (await api.getBins()) as BinRecord[];
+    const active = getActiveBin(global);
+
+    if (bins.length === 0) {
+      console.log('No bins found. Run: curlme init');
+      return;
+    }
+
+    printHeader(active || '-', undefined, `${bins.length} bins`);
+    console.log(`Active: ${active || '-'}`);
+    const recent = getRecentBins(global);
+    if (recent.length > 0) {
+      console.log(`Recent: ${recent.join(', ')}`);
+    }
+
+    if (!isTTY()) {
+      return;
+    }
+
+    const picked = await select<string>({
+      message: 'Select active bin',
+      choices: bins.slice(0, 20).map((b) => ({
+        value: b.publicId,
+        name: `${b.publicId}${b.publicId === active ? ' (active)' : ''}  ${b.name}`
+      }))
+    });
+
+    setActiveBin(picked, global);
+    pushRecentBin(picked, global);
+    console.log(`Active bin: ${picked}`);
+    return;
+  }
+
+  const bins = (await api.getBins()) as BinRecord[];
+  const match = bins.find((b) => b.publicId === selector || b.publicId.startsWith(selector) || b.name === selector);
+  if (!match) {
+    throw new Error(`Bin '${selector}' not found.`);
+  }
+
+  setActiveBin(match.publicId, global);
+  pushRecentBin(match.publicId, global);
+  console.log(`Active bin: ${match.publicId}`);
+  console.log(`Endpoint: ${endpointFor(match.publicId)}`);
+};
+
+const doStatus = async (options: GlobalOptions) => {
+  const active = getActiveBin(Boolean(options.global));
+  console.log(`Base URL: ${api.getBaseUrl()}`);
+  console.log(`Auth: ${config.get('apiKey') ? 'configured' : 'missing'}`);
+  console.log(`Active bin: ${active || '-'}`);
+  if (active) {
+    console.log(`Endpoint: ${endpointFor(active)}`);
+  }
+
+  try {
+    const user = await api.getWhoAmI();
+    console.log(`User: ${user.email || user.name || 'unknown'}`);
+    console.log(`Plan: ${user.plan || 'FREE'}`);
+  } catch {
+    console.log('User: not authenticated');
   }
 };
 
 program
   .name('curlme')
-  .description('Terminal-first request debugging')
-  .version('1.0.0')
-  .showHelpAfterError(true)
-  .configureHelp({
-    subcommandTerm: (cmd) => {
-      const aliases = cmd.aliases();
-      return pc.yellow(cmd.name() + (aliases.length ? `, ${aliases.join(', ')}` : ''));
-    },
-    commandUsage: (cmd) => pc.dim('curlme ') + pc.yellow('<command> ') + pc.dim('[options]'),
-  });
+  .description('Terminal-first HTTP request debugging')
+  .version(VERSION)
+  .option('--bin <id>', 'Explicit bin (advanced mode)')
+  .option('--global', 'Use global context instead of workspace context')
+  .option('--json', 'Machine-readable output')
+  .option('--no-create', 'Do not auto-create bin on `curlme`')
+  .showHelpAfterError();
 
-program.helpInformation = function() {
-  const activeBin = getActiveBin();
-  const branding = activeBin ? `${pc.bold('curlme')} ${pc.yellow(`(${activeBin})`)} > ` : `${pc.bold('curlme')} > `;
-
-  return `
-${pc.bold('curlme')} ${pc.dim('— terminal-first request debugging')}
-${pc.dim('Docs: https://docs.curlme.io')}
-
-${pc.bold('COMMANDS')}
-  ${pc.yellow('listen')}          Stream requests + interactive shortcuts
-  ${pc.yellow('latest')}          Show most recent request
-  ${pc.yellow('show <id>')}       Inspect a specific request
-  ${pc.yellow('replay <id>')}     Replay a request locally
-  ${pc.yellow('diff <a1> <a2>')}  Compare two requests
-  ${pc.yellow('upgrade')}         Upgrade to Pro for more power
-  ${pc.yellow('billing')}         Manage your subscription
-  ${pc.yellow('feedback')}        Send feedback or report a bug
-
-${pc.bold('AUTH')}
-  ${pc.yellow('auth login')}      Authenticate your CLI
-  ${pc.yellow('auth whoami')}     Show current user
-  ${pc.yellow('auth logout')}     Remove API key
-
-${pc.bold('BINS')}
-  ${pc.yellow('bin create')}      Create a new bin
-  ${pc.yellow('bin list')}        List all your bins
-  ${pc.yellow('bin use')}         Select active bin
-  ${pc.yellow('bin info')}        Show bin details
-  ${pc.yellow('bin delete')}      Delete a bin
-
-${pc.bold('USAGE')}
-  ${branding}${pc.yellow('<command>')}
-
-${activeBin ? `\n${pc.yellow('→')} ${pc.bold('Active Bin')} is ${pc.yellow(activeBin)}` : pc.dim('\n  Run `curlme bin use` to select a bin.')}
-`;
+program.helpInformation = function helpInformation() {
+  return `curlme - Terminal-first HTTP request debugging\n\nUsage:\n  curlme [command] [flags]\n  curlme                 Show active context or help\n\nCore:\n  init [name]            Create temp/named bin and set active\n  new [name]             Alias for init\n  bin [name|id]          Show/set active bin (alias: use)\n  listen, l              Stream incoming requests\n  latest                 Show latest request (full details)\n  show, s [ref]          Show request details (picker in TTY if ref omitted)\n  replay, r [ref]        Replay request (--to required; picker in TTY if ref omitted)\n  diff, d [a] [b]        Diff requests (default: 1 vs 2)\n  open [ref]             Open dashboard for active bin/request\n  export                 Export request history\n\nAccount:\n  login                  Authenticate\n  upgrade                Billing/plan\n  status                 Auth + active context + endpoint\n\n\nFlags:\n  --bin <id>             Explicit bin (advanced mode)\n  --global               Read/write global context\n  --json                 Scriptable output\n  --ui                   Interactive UI mode\n  --no-create            Do not auto-create bin on no-arg run\n  -h, --help             Help\n  -v, --version          Version\n`;
 };
 
-// --- AUTH GROUP ---
-const auth = program.command('auth').description('Manage your account and authentication');
-
-auth
-  .command('login')
-  .description('Login to curlme.io with your API key')
-  .action(async () => {
-    try {
-      console.log(`\n${pc.bold('Authenticate')} ${pc.dim('— generate key at ' + api.getBaseUrl() + '/account')}\n`);
-      
-      const response = await enquirer.prompt<{ apiKey: string }>({
-        type: 'input',
-        name: 'apiKey',
-        message: 'Enter API Key:'
-      });
-
-      if (response.apiKey) {
-        config.set('apiKey', response.apiKey);
-        const spinner = ora(pc.dim(`Verifying…`)).start();
-        try {
-          const user = await api.getWhoAmI();
-          spinner.stop();
-          console.log(`\n${pc.yellow('➜')} ${pc.bold('Authenticated')} as ${pc.yellow(user.email)}\n`);
-        } catch (error: any) {
-          spinner.fail(pc.red(`Not authenticated`));
-          console.log(`\nRun: ${pc.cyan('curlme auth login')}\n`);
-          showFeedbackSuggestion(true);
-          config.delete('apiKey');
-        }
-      }
-    } catch (e) {
-      return;
-    }
+program
+  .command('init [name]')
+  .description('Create temp/named bin and set active')
+  .action(async (name: string | undefined) => {
+    await doInit(name, program.opts<GlobalOptions>());
   });
 
-auth
-  .command('whoami')
-  .description('Display the current logged in user')
-  .action(async () => {
+program
+  .command('new [name]')
+  .description('Alias for init')
+  .action(async (name: string | undefined) => {
+    await doInit(name, program.opts<GlobalOptions>());
+  });
+
+const bin = program
+  .command('bin [selector]')
+  .description('Show or set active bin context')
+  .action(async (selector: string | undefined) => {
     try {
-      const user = await api.getWhoAmI();
-      const planColor = user.plan === 'FREE' ? pc.dim : pc.yellow;
-      console.log(`\n${pc.yellow('✔')} Logged in as ${pc.yellow(user.name)} ${pc.dim(`(${user.email})`)}`);
-      console.log(`  ${pc.bold('Plan')}        ${planColor(user.plan || 'FREE')}\n`);
+      const opts = program.opts<GlobalOptions>();
+      await doBinSet(selector, Boolean(opts.global));
     } catch (error: any) {
-      console.error(pc.red('\n✖ Not authenticated'));
-      console.log(`Run: ${pc.cyan('curlme auth login')}\n`);
+      console.error(error.message);
     }
   });
 
-auth
-  .command('logout')
-  .description('Log out and remove stored API key')
+bin
+  .command('set <selector>')
+  .description('Set active bin')
+  .action(async (selector: string) => {
+    try {
+      const opts = program.opts<GlobalOptions>();
+      await doBinSet(selector, Boolean(opts.global));
+    } catch (error: any) {
+      console.error(error.message);
+    }
+  });
+
+bin
+  .command('clear')
+  .description('Clear active bin for this workspace')
   .action(() => {
-    config.delete('apiKey');
-    console.log(pc.green('✔ Logged out successfully.'));
-  });
-
-program
-  .command('upgrade')
-  .description('Upgrade your account for more requests and features')
-  .action(async () => {
-    const url = `${api.getBaseUrl()}/pricing`;
-    console.log(`\n${pc.yellow('➜')} Opening ${pc.bold(url)}`);
-    console.log(`${pc.dim('You’ll be redirected to Stripe to complete your payment securely.')}\n`);
-    await openUrl(url);
-    console.log(`${pc.dim('Save hundreds of hours manual debugging with Pro.')}\n`);
-  });
-
-program
-  .command('billing')
-  .description('Manage your subscription and billing details')
-  .action(async () => {
-    const url = `${api.getBaseUrl()}/account?tab=plan`;
-    console.log(`\n${pc.yellow('➜')} Opening ${pc.bold(url)}`);
-    console.log(`${pc.dim('You’ll be redirected to the billing portal to manage your plan.')}\n`);
-    await openUrl(url);
-  });
-
-program
-  .command('feedback')
-  .description('Provide feedback or report an issue')
-  .action(async () => {
-    const version = '1.0.0'; // Should ideally pull from package.json
-    const platform = os.platform();
-    const release = os.release();
-    
-    const body = `
-### What happened?
-[Describe the issue or feedback here]
-
-### CLI Version:
-${version}
-
-### OS:
-${platform} ${release}
-`;
-
-    const url = `https://github.com/curlme-io/curlme/issues/new?body=${encodeURIComponent(body)}`;
-    
-    console.log(`\n${pc.yellow('➜')} Opening feedback page…\n`);
-    console.log(`If this is a bug, please include:`);
-    console.log(`- What you were trying to do`);
-    console.log(`- What happened instead\n`);
-    
-    await openUrl(url);
-  });
-
-// --- BIN GROUP ---
-const bin = program.command('bin').description('Manage your bins');
-
-bin
-  .command('list')
-  .alias('ls')
-  .description('List all your bins')
-  .option('--json', 'Output in JSON format')
-  .action(async (options) => {
-    const spinner = !options.json ? ora(pc.dim('Fetching…')).start() : null;
-    try {
-      const data = await api.getBins();
-      const activeBin = getActiveBin();
-      if (spinner) spinner.stop();
-
-      // Validate active bin
-      if (activeBin && !data.some((b: any) => b.publicId === activeBin)) {
-        config.delete('activeBinId');
-      }
-      
-      if (options.json) {
-        console.log(JSON.stringify(data, null, 2));
-        return;
-      }
-
-      if (data.length === 0) {
-        console.log(pc.yellow('\nNo bins found. Create one with `curlme bin create`'));
-        return;
-      }
-
-      console.log(`\n${pc.bold('Bins')}`);
-      
-      data.forEach((b: any) => {
-        const isActive = b.publicId === activeBin;
-        const prefix = isActive ? pc.yellow('→') : ' ';
-        const name = isActive ? pc.bold(b.name) : b.name;
-        const count = (b.requestCount !== undefined ? b.requestCount : b._count?.requests) || 0;
-        
-        console.log(`  ${prefix} ${pc.yellow(b.publicId.padEnd(20))} ${name.padEnd(20)} ${pc.dim(count + ' reqs')}`);
-      });
-      console.log('');
-    } catch (error: any) {
-      if (spinner) spinner.fail(pc.red(`Failed to list bins: ${error.message}`));
-      else console.error(pc.red(`Error: ${error.message}`));
-    }
+    const opts = program.opts<GlobalOptions>();
+    clearActiveBin(Boolean(opts.global));
+    console.log('Active bin cleared.');
   });
 
 bin
-  .command('use [id]')
-  .description('Set the active bin')
-  .action(async (id) => {
-    try {
-      let binId = id;
-      
-      if (!binId) {
-        const bins = await api.getBins();
-        if (bins.length === 0) {
-          console.log(pc.yellow('\nNo bins found. Create one with `curlme bin create`'));
-          if (getActiveBin()) {
-            config.delete('activeBinId');
-            console.log(pc.dim('Active bin cleared.'));
-          }
-          return;
-        }
+  .command('tail')
+  .description('Deprecated alias')
+  .action(() => {
+    console.log("'bin tail' is deprecated. Use: curlme listen");
+  });
 
-        const response = await enquirer.prompt<{ bin: string }>({
-          type: 'select',
-          name: 'bin',
-          message: 'Select a bin to use:',
-          choices: bins.map((b: any) => ({
-            name: b.publicId,
-            message: `${b.name} ${pc.dim(`(${b.publicId})`)}`
-          }))
-        });
-        binId = response.bin;
-      }
-
-      // Verify bin exists
-      const b = await api.getBin(binId);
-      setActiveBin(b.publicId);
-      console.log(`\n${pc.yellow('➜')} Active bin sets to ${pc.yellow(b.publicId)}\n`);
-    } catch (error) {
-      console.error(pc.red(`\n✖ Bin not found or selection cancelled\n`));
-    }
+bin
+  .command('use [selector]')
+  .description('Deprecated alias for `curlme bin`')
+  .action(async (selector: string | undefined) => {
+    console.log("Deprecated: 'bin use' -> 'bin'. Will be removed in v2.0.");
+    const opts = program.opts<GlobalOptions>();
+    await doBinSet(selector, Boolean(opts.global));
   });
 
 bin
   .command('create [name]')
-  .description('Create a new bin')
-  .action(async (name) => {
-    await checkUsage();
-    const binName = name || `bin-${Math.random().toString(36).substring(2, 8)}`;
-    const spinner = ora(pc.dim('Creating…')).start();
-    try {
-      const b = await api.createBin(binName);
-      setActiveBin(b.publicId);
-      spinner.stop();
-      
-      console.log(`\n${pc.yellow('➜')} ${pc.bold('Bin created')}\n`);
-      console.log(`  ${pc.bold('ID')}        ${pc.yellow(b.publicId)}`);
-      console.log(`  ${pc.bold('Hook')}      ${pc.dim(api.getBaseUrl() + '/h/')}${pc.yellow(b.publicId)}`);
-      console.log(`  ${pc.bold('Inspect')}   ${pc.cyan('curlme listen')}\n`);
-      showFeedbackSuggestion();
-    } catch (error: any) {
-      spinner.fail(pc.red(`Failed to create bin: ${error.message}`));
-      showFeedbackSuggestion(true);
-    }
+  .description('Deprecated alias for `curlme init`')
+  .action(async (name: string | undefined) => {
+    console.log("Deprecated: 'bin create' -> 'init'. Will be removed in v2.0.");
+    await doInit(name, program.opts<GlobalOptions>());
   });
 
 bin
-  .command('info [id]')
-  .description('Show detailed info about a bin')
-  .action(async (id) => {
-    const binId = requireBin(id);
-    const spinner = ora(pc.dim('Fetching bin info...')).start();
-    try {
-      const b = await api.getBin(binId);
-      spinner.stop();
-      console.log(`\n${pc.bold('Bin Info')} ${b.publicId === getActiveBin() ? pc.yellow('(active)') : ''}\n`);
-      console.log(`  ${pc.bold('Name')}      ${b.name}`);
-      console.log(`  ${pc.bold('ID')}        ${pc.yellow(b.publicId)}`);
-      console.log(`  ${pc.bold('Hooks')}     ${(b.requestCount !== undefined ? b.requestCount : b._count?.requests) || 0} received`);
-      console.log(`  ${pc.bold('URL')}       ${pc.dim(api.getBaseUrl() + '/bin/')}${pc.yellow(b.publicId)}`);
-      console.log(`  ${pc.bold('Endpoint')}  ${pc.dim(api.getBaseUrl() + '/h/')}${pc.yellow(b.publicId)}`);
-      console.log(`  ${pc.bold('Link')}      ${pc.blue('curlme://bin/')}${pc.blue(b.publicId)} ${pc.dim('(app link)')}`);
-      console.log('');
-    } catch (error: any) {
-      spinner.fail(pc.red(`Bin not found: ${binId}`));
-      if (binId === getActiveBin()) {
-        config.delete('activeBinId');
-        console.log(pc.dim('Active bin cleared.'));
-      }
-    }
+  .command('list')
+  .alias('ls')
+  .description('Deprecated list command')
+  .action(async () => {
+    console.log("Deprecated: 'bin list' -> 'bin'. Will be removed in v2.0.");
+    await doBinSet(undefined, Boolean(program.opts<GlobalOptions>().global));
   });
 
-bin
-  .command('delete [id]')
-  .description('Delete a bin')
-  .action(async (id) => {
-    try {
-      const binId = requireBin(id);
-      const confirm = await enquirer.prompt<{ confirmed: boolean }>({
-        type: 'confirm',
-        name: 'confirmed',
-        message: `Are you sure you want to delete bin ${binId}?`
-      });
-
-      if (!confirm.confirmed) return;
-
-      const spinner = ora(pc.dim(`Deleting bin...`)).start();
-      try {
-        await api.deleteBin(binId);
-        if (binId === getActiveBin()) {
-          config.delete('activeBinId');
-        }
-        spinner.succeed(pc.green(`Bin deleted`));
-      } catch (error: any) {
-        spinner.fail(pc.red(`Failed: ${error.message}`));
-      }
-    } catch (e) {
-      return;
-    }
-  });
-
-// --- TOP LEVEL COMMANDS ---
 program
-  .command('listen [binId]')
-  .alias('tail')
-  .description('Listen for incoming requests in real-time')
-  .option('--method <method>', 'Filter by HTTP method')
-  .action(async (binId, options) => {
-    await checkUsage();
-    const id = binId || getActiveBin();
-    if (!id) {
-      console.error(pc.red('\n✖ No bin specified and no active bin set.'));
-      console.log(`Run: ${pc.cyan('curlme bin use <binId>')}\n`);
-      return;
+  .command('use [selector]')
+  .description('Alias for `curlme bin [selector]`')
+  .action(async (selector: string | undefined) => {
+    await doBinSet(selector, Boolean(program.opts<GlobalOptions>().global));
+  });
+
+program
+  .command('listen')
+  .alias('l')
+  .description('Stream incoming requests')
+  .option('--since <duration>', 'Show backlog before streaming (e.g. 5m)')
+  .action(async (cmdOptions: { since?: string }) => {
+    const opts = program.opts<GlobalOptions>();
+    const binId = await getBinOrExit(opts);
+
+    let lastSince = Date.now();
+    const sinceMs = parseDurationMs(cmdOptions.since);
+    if (sinceMs) {
+      lastSince = Date.now() - sinceMs;
     }
 
-    // Verify bin exists before listening
-    const spinner = ora(pc.dim('Verifying bin...')).start();
-    try {
-      await api.getBin(id);
-      spinner.stop();
-    } catch (error: any) {
-      spinner.fail(pc.red(`Bin ${id} not found.`));
-      if (!binId) {
-        config.delete('activeBinId');
-        console.log(pc.dim('Active bin cleared.'));
-      }
-      return;
-    }
+    printHeader(binId, undefined, 'listening');
+    console.log('1  TIME      METHOD  PATH                          SIZE     ID');
 
-    setActiveBin(id);
-
-    console.log(`\n${pc.yellow('→')} Listening on ${pc.bold(id)} ${pc.dim('(active)')}`);
-    console.log(`  ${pc.dim('Waiting for requests…')}\n`);
-    showFeedbackSuggestion();
-
-    let lastTimestamp = Date.now();
-    let requestsCache: any[] = [];
-    
-    // Setup interactive shortcuts
-    if (process.stdin.isTTY) {
-      readline.emitKeypressEvents(process.stdin);
-      process.stdin.setRawMode(true);
-      
-      process.stdin.on('keypress', async (str, key) => {
-        if (key.ctrl && key.name === 'c') {
-          process.exit();
-        }
-
-        const latest = requestsCache[0];
-        const prev = requestsCache[1];
-
-        switch (key.name) {
-          case 'return':
-            if (latest) {
-              console.log(pc.dim('\n  ── Inspecting latest ──'));
-              formatRequest(latest);
-            }
-            break;
-          case 'r':
-            if (latest) {
-              console.log(pc.dim('\n  ── Replaying latest ──'));
-              program.parse(['node', 'curlme', 'replay', latest.id, id]);
-            }
-            break;
-          case 'd':
-            if (latest && prev) {
-              console.log(pc.dim('\n  ── Diffing latest vs previous ──'));
-              program.parse(['node', 'curlme', 'diff', latest.id, prev.id, id]);
-            } else {
-              console.log(pc.dim('\n  [ Need at least 2 requests to diff ]'));
-            }
-            break;
-          case 'o':
-            const url = `${api.getBaseUrl()}/bin/${id}`;
-            console.log(pc.dim(`\n  ── Opening ${url} ──`));
-            await openUrl(url);
-            break;
-        }
-      });
-
-      console.log(pc.dim('  [ Enter: inspect | R: replay | D: diff | O: open | Ctrl+C: quit ]\n'));
-    }
+    const seen = new Set<string>();
+    let rowIndex = 0;
 
     const poll = async () => {
       try {
-        const requests = await api.getRequests(id, lastTimestamp);
-        if (requests.length > 0) {
-          requests.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-          
-          requests.forEach((req: any) => {
-            if (options.method && req.method.toUpperCase() !== options.method.toUpperCase()) return;
-
-            const shortId = formatShortId(req.id);
-            const methodColor = req.method === 'GET' ? pc.green : pc.yellow;
-            console.log(`${pc.yellow('→')} ${pc.bold(methodColor(req.method.padEnd(6)))} ${req.path.padEnd(20)} ${pc.green('200')}  ${pc.dim(req.size.toString().padStart(4) + 'B')}  ${pc.yellow(shortId)}`);
-            
-            lastTimestamp = Math.max(lastTimestamp, new Date(req.timestamp).getTime() + 1);
-            requestsCache.unshift(req);
-            if (requestsCache.length > 10) requestsCache.pop(); // Keep small buffer
+        const reqs = (await api.getRequests(binId, lastSince)) as RequestRecord[];
+        reqs
+          .sort((a, b) => a.timestamp - b.timestamp)
+          .forEach((req) => {
+            if (seen.has(req.id)) return;
+            rowIndex += 1;
+            seen.add(req.id);
+            printRequestRow(rowIndex, req);
+            lastSince = Math.max(lastSince, req.timestamp + 1);
           });
-        }
-      } catch (error: any) {
-        // Quietly retry on polling errors
+      } catch {
+        // keep polling
       }
-      setTimeout(poll, 1500);
+      setTimeout(poll, 1200);
     };
 
     poll();
   });
 
 program
-  .command('latest [binId]')
-  .alias('l')
-  .description('Show the latest request')
-  .action(async (binId) => {
-    const id = requireBin(binId);
-    const spinner = ora(pc.dim('Fetching latest request...')).start();
+  .command('latest')
+  .description('Show latest request (same as show 1)')
+  .option('--summary', 'One-line summary')
+  .action(async (cmdOptions: { summary?: boolean }) => {
     try {
-      const reqs = await api.getRequests(id);
-      spinner.stop();
-
+      const opts = program.opts<GlobalOptions>();
+      const binId = await getBinOrExit(opts);
+      const reqs = (await api.getRequests(binId)) as RequestRecord[];
       if (reqs.length === 0) {
-        console.log(pc.yellow('No requests found for this bin.'));
+        console.log(`No requests yet in active bin '${binId}'. Send one, then run: curlme listen`);
         return;
       }
-      formatRequest(reqs[0]);
+
+      printHeader(binId, reqs.length, 'latest');
+      if (cmdOptions.summary) {
+        console.log('1  TIME      METHOD  PATH                          SIZE     ID');
+        printRequestRow(1, reqs[0]);
+        return;
+      }
+
+      printRequestDetail(reqs[0], '1');
     } catch (error: any) {
-      spinner.fail(pc.red(handleBinError(error, id)));
+      console.error(error.message);
     }
   });
 
 program
-  .command('show <requestId> [binId]')
+  .command('show [ref]')
   .alias('s')
-  .description('Inspect a specific request')
-  .action(async (requestId, binId) => {
-    const id = requireBin(binId);
-    const spinner = ora(pc.dim('Fetching request...')).start();
+  .description('Show request details')
+  .option('--headers', 'Show headers only')
+  .option('--body', 'Show body only')
+  .option('--meta', 'Show metadata only')
+  .action(async (ref: string | undefined, cmdOptions: { headers?: boolean; body?: boolean; meta?: boolean }) => {
     try {
-      const reqs = await api.getRequests(id);
-      const r = reqs.find((x: any) => x.id === requestId || x.id.startsWith(requestId) || formatShortId(x.id) === requestId);
-      spinner.stop();
-
-      if (!r) {
-        console.log(pc.red('✖ Request not found.'));
+      const opts = program.opts<GlobalOptions>();
+      const binId = await getBinOrExit(opts);
+      const reqs = (await api.getRequests(binId)) as RequestRecord[];
+      if (reqs.length === 0) {
+        console.log(`No requests yet in active bin '${binId}'. Send one, then run: curlme listen`);
         return;
       }
-      formatRequest(r);
+
+      const selected = await requireRefOrPick(ref, reqs, 'Select request');
+      const index = reqs.findIndex((r) => r.id === selected.id);
+      printHeader(binId, reqs.length, 'show');
+
+      if (cmdOptions.headers) {
+        console.log('Headers');
+        for (const [k, v] of Object.entries(selected.headers || {})) {
+          console.log(`- ${k}: ${v}`);
+        }
+        return;
+      }
+
+      if (cmdOptions.body) {
+        console.log(selected.body || '(empty)');
+        return;
+      }
+
+      if (cmdOptions.meta) {
+        console.log(`Request: ${index + 1}`);
+        console.log(`ID: ${selected.id}`);
+        console.log(`Time: ${toIso(selected.timestamp)}`);
+        console.log(`Method: ${selected.method}`);
+        console.log(`Path: ${selected.path || '/'}`);
+        console.log(`IP: ${selected.ip || '-'}`);
+        console.log(`Size: ${bytes(selected.size)}`);
+        return;
+      }
+
+      printRequestDetail(selected, String(index + 1));
     } catch (error: any) {
-      spinner.fail(pc.red(handleBinError(error, id)));
+      console.error(error.message);
     }
   });
 
 program
-  .command('replay [requestId] [binId]')
+  .command('replay [ref]')
   .alias('r')
-  .description('Replay a request')
-  .option('--to <url>', 'Local target URL', 'http://localhost:3000')
-  .action(async (requestId, binId, options) => {
-    const id = requireBin(binId);
-    const spinner = ora(pc.dim('Fetching request to replay...')).start();
+  .description('Replay request to target URL')
+  .requiredOption('--to <url>', 'Target URL')
+  .option('--timeout <ms>', 'Request timeout', '15000')
+  .action(async (ref: string | undefined, cmdOptions: { to: string; timeout: string }) => {
     try {
-      const reqs = await api.getRequests(id);
-      const r = (!requestId || requestId === 'latest') 
-        ? reqs[0] 
-        : reqs.find((x: any) => x.id === requestId || x.id.startsWith(requestId) || formatShortId(x.id) === requestId);
-      
-      if (spinner) spinner.stop();
-
-      if (!r) {
-        console.log(pc.red('✖ Request not found.'));
+      const opts = program.opts<GlobalOptions>();
+      const binId = await getBinOrExit(opts);
+      const reqs = (await api.getRequests(binId)) as RequestRecord[];
+      if (reqs.length === 0) {
+        console.log(`No requests yet in active bin '${binId}'. Send one, then run: curlme listen`);
         return;
       }
 
-      // Plan check for history replay
-      const usage = await api.getUsage();
-      const isLatest = reqs[0]?.id === r.id;
-      if (usage?.plan === 'FREE' && !isLatest) {
-        console.log(`\n${pc.yellow('⚠')} ${pc.bold('This action requires request history.')}`);
-        console.log(`${pc.dim('Upgrade to Pro to replay any request and save hours of re-triggering webhooks.')}`);
-        console.log(`${pc.yellow('→')} Run: ${pc.bold('curlme upgrade')}\n`);
-        return;
-      }
+      const selected = await requireRefOrPick(ref, reqs, 'Pick request to replay');
+      const targetUrl = new URL(selected.path || '/', cmdOptions.to).toString();
+      const started = Date.now();
 
-      const axios = require('axios');
-      const targetUrl = new URL(r.path, options.to).toString();
-      const replayedSpinner = ora(pc.dim(`Replaying ${pc.bold(r.method)} to ${targetUrl}...`)).start();
-      
-      const start = Date.now();
-      try {
-        const response = await axios({
-          method: r.method,
-          url: targetUrl,
-          headers: { ...r.headers, 'x-replayed-by': 'curlme' },
-          data: r.body,
-          validateStatus: () => true
-        });
-        const duration = Date.now() - start;
-        
-        replayedSpinner.stop();
-        
-        console.log(`\n${pc.yellow('✔')} ${pc.bold('Replayed')} ${formatShortId(r.id)}`);
-        console.log(DIVIDER);
-        console.log(`${pc.bold('Target')}    ${pc.dim(targetUrl)}`);
-        console.log(`${pc.bold('Status')}    ${pc.yellow(response.status)}`);
-        console.log(`${pc.bold('Duration')}  ${pc.dim(duration + 'ms')}\n`);
-      } catch (err: any) {
-        replayedSpinner.fail(pc.red(`Failed: ${err.message}`));
-      }
+      const response = await axios({
+        method: selected.method,
+        url: targetUrl,
+        headers: {
+          ...selected.headers,
+          'x-replayed-by': 'curlme'
+        },
+        data: selected.body,
+        timeout: Number(cmdOptions.timeout),
+        validateStatus: () => true
+      });
+
+      const elapsed = Date.now() - started;
+      console.log(`Replayed request ${shortRequestId(selected.id)} to ${cmdOptions.to}`);
+      console.log(`Response: ${response.status} in ${elapsed}ms`);
     } catch (error: any) {
-      if (spinner) spinner.fail(pc.red(handleBinError(error, id)));
+      console.error(error.message);
     }
   });
 
 program
-  .command('diff [id1] [id2] [binId]')
+  .command('diff [a] [b]')
   .alias('d')
-  .description('Show differences between two requests')
-  .action(async (id1, id2, binId) => {
-    // Determine which argument is the binId if provided
-    let actualBinId = binId;
-    let rid1 = id1 || 'latest';
-    let rid2 = id2 || 'prev';
-
-    const id = requireBin(actualBinId);
-    const spinner = ora(pc.dim('Fetching requests...')).start();
+  .description('Diff requests (default: 1 vs 2)')
+  .action(async (a: string | undefined, b: string | undefined) => {
     try {
-      const reqs = await api.getRequests(id);
-      const getReq = (rid: string, index: number) => {
-        if (rid === 'latest') return reqs[0];
-        if (rid === 'prev') return reqs[1];
-        return reqs.find((x: any) => x.id === rid || x.id.startsWith(rid) || formatShortId(x.id) === rid);
-      };
+      const opts = program.opts<GlobalOptions>();
+      const binId = await getBinOrExit(opts);
+      const reqs = (await api.getRequests(binId)) as RequestRecord[];
 
-      const r1 = getReq(rid1, 0);
-      const r2 = getReq(rid2, 1);
-      spinner.stop();
-
-      if (!r1 || !r2) {
-        console.log(pc.red('\n✖ One or both requests not found.'));
+      if (reqs.length < 2) {
+        console.log('Need at least 2 requests to diff. Next: curlme listen');
         return;
       }
 
-      // Plan check for diff history
-      const usage = await api.getUsage();
-      const isR1InLatestTwo = reqs.slice(0, 2).some((x: any) => x.id === r1.id);
-      const isR2InLatestTwo = reqs.slice(0, 2).some((x: any) => x.id === r2.id);
+      const leftRef = a || '1';
+      const rightRef = b || '2';
+      const left = resolveRef(leftRef, reqs);
+      const right = resolveRef(rightRef, reqs);
 
-      if (usage?.plan === 'FREE' && (!isR1InLatestTwo || !isR2InLatestTwo)) {
-        console.log(`\n${pc.yellow('⚠')} ${pc.bold('Diff limited to last 2 requests.')}`);
-        console.log(`${pc.dim('Upgrade to Pro for full history comparison and stop hunting for differences manually.')}`);
-        console.log(`${pc.yellow('→')} Run: ${pc.bold('curlme upgrade')}\n`);
-        return;
+      if (!left || !right) {
+        throw new Error(`Could not resolve diff refs '${leftRef}' and '${rightRef}'.`);
       }
 
-      console.log(`\n${pc.yellow('➜')} ${pc.bold('Diffing')} ${pc.yellow(formatShortId(r1.id))} vs ${pc.yellow(formatShortId(r2.id))}\n`);
+      const leftIndex = reqs.findIndex((r) => r.id === left.id) + 1;
+      const rightIndex = reqs.findIndex((r) => r.id === right.id) + 1;
 
-      if (r1.body !== r2.body) {
-        console.log(`  ${pc.bold('Body')}\n`);
-        console.log(`    ${pc.red('-')} [Request 1 Body]`);
-        console.log(`    ${pc.green('+')} [Request 2 Body]`);
-      } else {
-        console.log(`  ${pc.dim('Bodies are identical.')}`);
+      console.log(`Diff ${leftIndex} vs ${rightIndex}`);
+      if (left.method !== right.method) console.log(`- Method: ${left.method} -> ${right.method}`);
+      if ((left.path || '/') !== (right.path || '/')) console.log(`- Path: ${left.path || '/'} -> ${right.path || '/'}`);
+      if (bytes(left.size) !== bytes(right.size)) console.log(`- Body size: ${bytes(left.size)} -> ${bytes(right.size)}`);
+
+      const headerKeys = new Set<string>([...Object.keys(left.headers || {}), ...Object.keys(right.headers || {})]);
+      let headerChanges = 0;
+      for (const key of headerKeys) {
+        const lv = (left.headers || {})[key];
+        const rv = (right.headers || {})[key];
+        if (lv === rv) continue;
+        if (lv === undefined) console.log(`- Header added: ${key}`);
+        else if (rv === undefined) console.log(`- Header removed: ${key}`);
+        else console.log(`- Header changed: ${key}`);
+        headerChanges += 1;
+        if (headerChanges >= 8) break;
       }
-      console.log('');
+
+      if (left.body === right.body && left.method === right.method && left.path === right.path && left.size === right.size) {
+        console.log('No material differences found.');
+      }
     } catch (error: any) {
-      spinner.stop();
-      console.error(pc.red(handleBinError(error, id)));
+      console.error(error.message);
     }
   });
 
 program
-  .command('open [binId]')
-  .description('Open the dashboard for a bin')
-  .action(async (binId) => {
-    const id = requireBin(binId);
-    const url = `${api.getBaseUrl()}/bin/${id}`;
-    console.log(`${pc.green('✔')} Opening ${pc.cyan(url)}`);
+  .command('open [ref]')
+  .description('Open dashboard for active bin or request')
+  .action(async (ref: string | undefined) => {
+    try {
+      const opts = program.opts<GlobalOptions>();
+      const binId = await getBinOrExit(opts);
+      let requestId: string | undefined;
+      if (ref) {
+        const reqs = (await api.getRequests(binId)) as RequestRecord[];
+        const selected = resolveRef(ref, reqs);
+        if (!selected) {
+          throw new Error(`Request '${ref}' not found.`);
+        }
+        requestId = selected.id;
+      }
+
+      const url = dashboardFor(binId, requestId);
+      console.log(`Opening ${url}`);
+      await openUrl(url);
+    } catch (error: any) {
+      console.error(error.message);
+    }
+  });
+
+program
+  .command('export')
+  .description('Export request history')
+  .option('--format <format>', 'json|curl', 'json')
+  .action(async (cmdOptions: { format: string }) => {
+    try {
+      const opts = program.opts<GlobalOptions>();
+      const binId = await getBinOrExit(opts);
+      const payload = await api.getExport(binId, cmdOptions.format);
+      if (opts.json) {
+        console.log(JSON.stringify(payload));
+        return;
+      }
+      console.log(JSON.stringify(payload, null, 2));
+    } catch (error: any) {
+      console.error(error.message);
+    }
+  });
+
+program
+  .command('login')
+  .description('Authenticate CLI with API key')
+  .action(async () => {
+    try {
+      const key = await password({
+        message: 'Enter API key',
+        mask: '*'
+      });
+
+      if (!key || !key.trim()) {
+        console.error('No API key provided.');
+        return;
+      }
+
+      config.set('apiKey', key.trim());
+      const user = await api.getWhoAmI();
+      console.log(`Authenticated as ${user.email || user.name || 'user'}`);
+    } catch (error: any) {
+      config.delete('apiKey');
+      console.error(`Authentication failed: ${error.message}`);
+    }
+  });
+
+program
+  .command('status')
+  .description('Show auth and active context')
+  .action(async () => {
+    await doStatus(program.opts<GlobalOptions>());
+  });
+
+program
+  .command('upgrade')
+  .description('Open billing/upgrade')
+  .action(async () => {
+    const url = `${api.getBaseUrl()}/pricing`;
+    console.log(`Opening ${url}`);
     await openUrl(url);
   });
 
-// --- EXPORT COMMAND ---
 program
-  .command('export [binId]')
-  .description('Export requests from a bin')
-  .option('--format <format>', 'Export format (json, curl)', 'json')
-  .action(async (binId, options) => {
-    const id = requireBin(binId);
-    const spinner = ora(pc.dim(`Exporting bin ${id}...`)).start();
-    try {
-      const data = await api.getExport(id, options.format);
-      spinner.succeed(pc.green('Export complete'));
-      console.log(JSON.stringify(data, null, 2));
-    } catch (error: any) {
-      spinner.fail(pc.red(handleBinError(error, id)));
-    }
+  .command('billing')
+  .description('Deprecated alias for `upgrade`')
+  .action(async () => {
+    console.log("Deprecated: 'billing' -> 'upgrade'. Will be removed in v2.0.");
+    const url = `${api.getBaseUrl()}/account?tab=plan`;
+    await openUrl(url);
   });
 
-program.parse(process.argv);
+// Backward-compatible auth group
+const auth = program.command('auth').description('Deprecated auth group');
+auth
+  .command('login')
+  .action(async () => {
+    console.log("Deprecated: 'auth login' -> 'login'. Will be removed in v2.0.");
+    await program.parseAsync(['node', 'curlme', 'login'], { from: 'user' });
+  });
+auth
+  .command('whoami')
+  .action(async () => {
+    console.log("Deprecated: 'auth whoami' -> 'status'. Will be removed in v2.0.");
+    await doStatus(program.opts<GlobalOptions>());
+  });
+auth
+  .command('logout')
+  .action(() => {
+    config.delete('apiKey');
+    console.log('Logged out.');
+  });
+
+// Backward-compatible request group
+const requestGroup = program.command('request').description('Deprecated request group');
+requestGroup
+  .command('latest')
+  .action(async () => {
+    console.log("Deprecated: 'request latest' -> 'latest'. Will be removed in v2.0.");
+    await program.parseAsync(['node', 'curlme', 'latest'], { from: 'user' });
+  });
+requestGroup
+  .command('show [ref]')
+  .action(async (ref: string | undefined) => {
+    console.log("Deprecated: 'request show' -> 'show'. Will be removed in v2.0.");
+    const argv = ref ? ['node', 'curlme', 'show', ref] : ['node', 'curlme', 'show'];
+    await program.parseAsync(argv, { from: 'user' });
+  });
+requestGroup
+  .command('replay [ref]')
+  .requiredOption('--to <url>')
+  .action(async (ref: string | undefined, cmdOptions: { to: string }) => {
+    console.log("Deprecated: 'request replay' -> 'replay'. Will be removed in v2.0.");
+    const argv = ['node', 'curlme', 'replay'];
+    if (ref) argv.push(ref);
+    argv.push('--to', cmdOptions.to);
+    await program.parseAsync(argv, { from: 'user' });
+  });
+requestGroup
+  .command('diff [a] [b]')
+  .action(async (a: string | undefined, b: string | undefined) => {
+    console.log("Deprecated: 'request diff' -> 'diff'. Will be removed in v2.0.");
+    const argv = ['node', 'curlme', 'diff'];
+    if (a) argv.push(a);
+    if (b) argv.push(b);
+    await program.parseAsync(argv, { from: 'user' });
+  });
+
+program.on('command:*', (operands) => {
+  const attempted = operands[0];
+  if (!attempted) return;
+
+  if (attempted === 'requests' || attempted === 'request') {
+    console.error("Unknown command 'requests'. Did you mean: show, latest, or listen?");
+    process.exit(1);
+  }
+
+  const suggestions = closestCommands(attempted).join(', ');
+  console.error(`Unknown command '${attempted}'. Did you mean: ${suggestions}?`);
+  process.exit(1);
+});
+
+(async () => {
+  const argv = process.argv.slice(2);
+  const noCommand = argv.length === 0 || (argv.length === 1 && argv[0] === '--no-create');
+
+  if (noCommand) {
+    const noCreate = argv.includes('--no-create');
+    const active = getActiveBin(false);
+
+    if (active) {
+      printHeader(active);
+      console.log('Next: curlme listen');
+      console.log('Then: curlme latest');
+      console.log('Then: curlme show 1');
+      return;
+    }
+
+    if (noCreate) {
+      printQuickHelp();
+      return;
+    }
+
+    printQuickHelp();
+    return;
+  }
+
+  await program.parseAsync(process.argv);
+})();
+
+
+
+
